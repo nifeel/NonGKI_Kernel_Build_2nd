@@ -128,7 +128,7 @@ jobs:
           sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-perf+"/' ./arch/${{ env.KERNEL_ARCH }}/configs/${{ env.DEFCONFIG_NAME }}
           grep -q '^CONFIG_LOCALVERSION="-perf+"' ./arch/${{ env.KERNEL_ARCH }}/configs/${{ env.DEFCONFIG_NAME }} || echo 'CONFIG_LOCALVERSION="-perf+"' >> ./arch/${{ env.KERNEL_ARCH }}/configs/${{ env.DEFCONFIG_NAME }}
           echo "# CONFIG_LOCALVERSION_AUTO is not set" >> ./arch/${{ env.KERNEL_ARCH }}/configs/${{ env.DEFCONFIG_NAME }}
-          printf '#!/bin/sh\nexit 0\n' > scripts/setlocalversion
+          printf '#!/bin/sh\necho -perf+\n' > scripts/setlocalversion
           chmod +x scripts/setlocalversion
 
           # Spoof /proc/version (fs/proc/version.c) with stock OnePlus 8 ColorOS 13.1 F.74 compiler string
