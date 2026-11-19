@@ -9,7 +9,7 @@ env:
   DEVICE_NAME : "oneplus_8_cn"
   DEVICE_CODENAME : "instantnoodle"
 
-  CUSTOM_CMDS : "CLANG_TRIPLE=aarch64-linux-gnu-"
+  CUSTOM_CMDS : "CLANG_TRIPLE=aarch64-linux-gnu- KBUILD_BUILD_USER=root KBUILD_BUILD_HOST=dg02-pool06-kvm47"
   EXTRA_CMDS : ""
 
   KERNEL_SOURCE : "https://github.com/TropsPk/Tropsi_X_Kernel_SM8250.git"
@@ -119,7 +119,61 @@ jobs:
           # Only ${{ env.DEVICE_NAME }} use it.
           cd $GITHUB_WORKSPACE/device_kernel
 
-          # Nothing
+          # Spoof exact stock OnePlus 8 ColorOS 13.1 F.74 build metadata
+          echo "KBUILD_BUILD_USER=root" >> $GITHUB_ENV
+          echo "KBUILD_BUILD_HOST=dg02-pool06-kvm47" >> $GITHUB_ENV
+          echo "KBUILD_BUILD_TIMESTAMP=Thu Jun 6 00:12:43 CST 2024" >> $GITHUB_ENV
+
+          # Set stock localversion (-perf+) and prevent scripts/setlocalversion from appending anything
+          sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-perf+"/' ./arch/${{ env.KERNEL_ARCH }}/configs/${{ env.DEFCONFIG_NAME }}
+          grep -q '^CONFIG_LOCALVERSION="-perf+"' ./arch/${{ env.KERNEL_ARCH }}/configs/${{ env.DEFCONFIG_NAME }} || echo 'CONFIG_LOCALVERSION="-perf+"' >> ./arch/${{ env.KERNEL_ARCH }}/configs/${{ env.DEFCONFIG_NAME }}
+          echo "# CONFIG_LOCALVERSION_AUTO is not set" >> ./arch/${{ env.KERNEL_ARCH }}/configs/${{ env.DEFCONFIG_NAME }}
+          printf '#!/bin/sh\nexit 0\n' > scripts/setlocalversion
+          chmod +x scripts/setlocalversion
+
+          # Spoof /proc/version (fs/proc/version.c) with stock OnePlus 8 ColorOS 13.1 F.74 compiler string
+          cat << 'EOF' > fs/proc/version.c
+          // SPDX-License-Identifier: GPL-2.0
+          #include <linux/fs.h>
+          #include <linux/init.h>
+          #include <linux/kernel.h>
+          #include <linux/proc_fs.h>
+          #include <linux/seq_file.h>
+          #include <linux/utsname.h>
+
+          static int version_proc_show(struct seq_file *m, void *v)
+          {
+              seq_printf(m,
+                  "%s version %s (root@dg02-pool06-kvm47) (clang version 10.0.7 for Android NDK, GNU ld (binutils-2.27-bd24d23f) 2.27.0.20170315) %s\n",
+                  utsname()->sysname,
+                  utsname()->release,
+                  utsname()->version);
+              return 0;
+          }
+
+          static int __init proc_version_init(void)
+          {
+              proc_create_single("version", 0, NULL, version_proc_show);
+              return 0;
+          }
+          fs_initcall(proc_version_init);
+          EOF
+
+          # Spoof linux_banner and linux_proc_banner in init/version.c
+          python3 - << 'PYEOF'
+          with open("init/version.c", "r") as f:
+              c = f.read()
+          c = c.replace(
+              '" (" LINUX_COMPILE_BY "@"\n\tLINUX_COMPILE_HOST ") (" LINUX_COMPILER ") "',
+              '" (root@dg02-pool06-kvm47) (clang version 10.0.7 for Android NDK, GNU ld (binutils-2.27-bd24d23f) 2.27.0.20170315) "'
+          )
+          c = c.replace(
+              '\t" (" LINUX_COMPILE_BY "@" LINUX_COMPILE_HOST ")"\n\t" (" LINUX_COMPILER ") %s\\n";',
+              '\t" (root@dg02-pool06-kvm47) (clang version 10.0.7 for Android NDK, GNU ld (binutils-2.27-bd24d23f) 2.27.0.20170315) %s\\n";'
+          )
+          with open("init/version.c", "w") as f:
+              f.write(c)
+          PYEOF
 
       - name: 🧰 Patch Kernel of Re:Kernel
         uses: ./.github/workflows/patch-rekernel
