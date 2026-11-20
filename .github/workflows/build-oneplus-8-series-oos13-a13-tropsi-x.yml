@@ -179,6 +179,255 @@ jobs:
           sed -i 's/t->sender_euid = proc->cred->euid;/t->sender_euid = task_euid(proc->tsk);/' drivers/android/binder.c
           grep -q 't->sender_euid = task_euid(proc->tsk);' drivers/android/binder.c
 
+          # 1) Fix selinux_hide timing side-channel (fast-path single-policydb on stack)
+          # 2) Filter cross-app getpriority/setpriority & ioprio_get/ioprio_set in kernel source
+          # 3) Hide residual KSU/SuSFS/BBG symbols in /proc/kallsyms
+          python3 - << 'PYEOF'
+          # --- 1. drivers/kernelsu/feature/selinux_hide.c ---
+          with open("drivers/kernelsu/feature/selinux_hide.c", "r") as f:
+              sh = f.read()
+
+          old_s2c_start = "/*\n * Caveat:  Mutates scontext.\n */\nstatic int string_to_context_struct("
+          old_s2c_end = "    *orig_rc_p = orig_rc;\n    return rc;\n}"
+          s1 = sh.index(old_s2c_start)
+          e1 = sh.index(old_s2c_end, s1) + len(old_s2c_end)
+
+          new_s2c = """/*
+           * Caveat:  Mutates scontext.
+           */
+          static int ksu_string_to_context_one(struct policydb *pol, struct sidtab *sidtabp, char *scontext,
+                                               u32 scontext_len, struct context *ctx, u32 def_sid)
+          {
+              struct role_datum *role;
+              struct type_datum *typdatum;
+              struct user_datum *usrdatum;
+              char *scontextp, *p, oldc;
+              int rc = -EINVAL;
+
+              context_init(ctx);
+              scontextp = scontext;
+
+              /* Extract the user. */
+              p = scontextp;
+              while (*p && *p != ':')
+                  p++;
+              if (*p == 0)
+                  goto out;
+              *p++ = 0;
+
+              usrdatum = symtab_search(&pol->p_users, scontextp);
+              if (!usrdatum)
+                  goto out;
+              ctx->user = usrdatum->value;
+
+              /* Extract role. */
+              scontextp = p;
+              while (*p && *p != ':')
+                  p++;
+              if (*p == 0)
+                  goto out;
+              *p++ = 0;
+
+              role = symtab_search(&pol->p_roles, scontextp);
+              if (!role)
+                  goto out;
+              ctx->role = role->value;
+
+              /* Extract type. */
+              scontextp = p;
+              while (*p && *p != ':')
+                  p++;
+              oldc = *p;
+              *p++ = 0;
+
+              typdatum = symtab_search(&pol->p_types, scontextp);
+              if (!typdatum || typdatum->attribute)
+                  goto out;
+              ctx->type = typdatum->value;
+
+          #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0) || defined(KSU_COMPAT_HAS_STRICTER_MLS_CONTEXT_TO_SID)
+              rc = mls_context_to_sid(pol, oldc, p, ctx, sidtabp, def_sid);
+          #else
+              rc = mls_context_to_sid(pol, oldc, &p, ctx, sidtabp, def_sid);
+              if ((p - scontext) < scontext_len) {
+                  rc = -EINVAL;
+                  goto out;
+              }
+          #endif
+              if (rc)
+                  goto out;
+
+              /* Check the validity of the new context. */
+              rc = -EINVAL;
+              if (policydb_context_isvalid(pol, ctx))
+                  rc = 0;
+          out:
+              if (rc)
+                  context_destroy(ctx);
+              return rc;
+          }""".replace("\n          ", "\n")
+
+          sh = sh[:s1] + new_s2c + sh[e1:]
+
+          old_k2s_start = (
+              "// remove static in susfs\n"
+              "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)\n"
+              "__maybe_static int security_context_to_sid_with_policy("
+          )
+          old_k2s_end = "    kfree(scontext3);\n    kfree(scontext2);\n    kfree(str);\n    return rc;\n}"
+          assert sh.count(old_k2s_start) == 1, f"old_k2s_start count={sh.count(old_k2s_start)}"
+          s2 = sh.index(old_k2s_start)
+          e2 = sh.index(old_k2s_end, s2) + len(old_k2s_end)
+
+          new_k2s = """// remove static in susfs
+          #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
+          __maybe_static int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext,
+                                                                 u32 scontext_len, u32 *sid, u32 def_sid, gfp_t gfp_flags,
+                                                                 u32 *orig_sid_p, int *orig_rc_p)
+          #else
+          static int ksu_security_context_to_sid(struct policydb *orig_policydb, struct sidtab *orig_sidtab,
+                                                 struct policydb *policydb, struct sidtab *sidtab, const char *scontext,
+                                                 u32 scontext_len, u32 *sid, u32 def_sid, gfp_t gfp_flags, u32 *orig_sid_p,
+                                                 int *orig_rc_p)
+          #endif
+          {
+          #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
+              struct selinux_policy *orig_policy;
+              struct policydb *policydb, *orig_policydb;
+              struct sidtab *sidtab, *orig_sidtab;
+          #endif
+              char stack_buf2[128], stack_buf3[128];
+              char *scontext2, *scontext3;
+              struct context context, orig_context;
+              int rc = 0, orig_rc = -EINVAL;
+              u32 orig_sid;
+
+              /* An empty security context is never valid. */
+              if (!scontext_len)
+                  return -EINVAL;
+
+              if (scontext_len < sizeof(stack_buf2)) {
+                  memcpy(stack_buf2, scontext, scontext_len);
+                  stack_buf2[scontext_len] = '\\0';
+                  scontext2 = stack_buf2;
+              } else {
+                  scontext2 = kmemdup_nul(scontext, scontext_len, gfp_flags);
+                  if (!scontext2)
+                      return -ENOMEM;
+              }
+
+              *sid = SECSID_NULL;
+              if (orig_sid_p)
+                  *orig_sid_p = SECSID_NULL;
+
+          #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
+              rcu_read_lock();
+              orig_policy = rcu_dereference(selinux_state.policy);
+              orig_policydb = &orig_policy->policydb;
+              orig_sidtab = orig_policy->sidtab;
+              policydb = &policy->policydb;
+              sidtab = policy->sidtab;
+          #else
+              ksu_lock_sepolicy_legacy();
+          #endif
+              rc = ksu_string_to_context_one(policydb, sidtab, scontext2, scontext_len, &context, def_sid);
+              if (!rc) {
+          #ifdef KSU_COMPAT_HAS_CONTEXT_ADD_HASH
+                  rc = context_add_hash(policydb, &context);
+          #endif
+                  if (!rc)
+                      rc = sidtab_context_to_sid(sidtab, &context, sid);
+                  context_destroy(&context);
+
+                  if (orig_sid_p || orig_rc_p) {
+                      if (scontext_len < sizeof(stack_buf3)) {
+                          memcpy(stack_buf3, scontext, scontext_len);
+                          stack_buf3[scontext_len] = '\\0';
+                          scontext3 = stack_buf3;
+                      } else {
+                          scontext3 = kmemdup_nul(scontext, scontext_len, GFP_ATOMIC);
+                      }
+                      if (!scontext3) {
+                          orig_rc = -ENOMEM;
+                      } else {
+                          orig_rc = ksu_string_to_context_one(orig_policydb, orig_sidtab, scontext3, scontext_len,
+                                                              &orig_context, def_sid);
+                          if (!orig_rc) {
+          #ifdef KSU_COMPAT_HAS_CONTEXT_ADD_HASH
+                              orig_rc = context_add_hash(orig_policydb, &orig_context);
+          #endif
+                              if (!orig_rc) {
+                                  orig_rc = sidtab_context_to_sid(orig_sidtab, &orig_context, &orig_sid);
+                                  if (orig_sid_p)
+                                      *orig_sid_p = orig_sid;
+                              }
+                              context_destroy(&orig_context);
+                          }
+                          if (scontext3 != stack_buf3)
+                              kfree(scontext3);
+                      }
+                  }
+              } else {
+                  (void)orig_policydb;
+                  (void)orig_sidtab;
+              }
+          #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
+              rcu_read_unlock();
+          #else
+              ksu_unlock_sepolicy_legacy();
+          #endif
+              if (orig_rc_p)
+                  *orig_rc_p = orig_rc;
+              if (scontext2 != stack_buf2)
+                  kfree(scontext2);
+              return rc;
+          }""".replace("\n          ", "\n")
+
+          sh = sh[:s2] + new_k2s + sh[e2:]
+          assert "ksu_string_to_context_one" in sh and "string_to_context_struct" not in sh
+          with open("drivers/kernelsu/feature/selinux_hide.c", "w") as f:
+              f.write(sh)
+
+          # --- 2a. kernel/sys.c ---
+          with open("kernel/sys.c", "r") as f:
+              sysc = f.read()
+          old_sys = "\t\telse if (!uid_eq(uid, cred->uid)) {\n\t\t\tuser = find_user(uid);"
+          new_sys = "\t\telse if (!uid_eq(uid, cred->uid)) {\n\t\t\tif (cred->uid.val >= 10000 && uid.val >= 10000)\n\t\t\t\tgoto out_unlock;\n\t\t\tuser = find_user(uid);"
+          assert sysc.count(old_sys) == 2, f"kernel/sys.c count={sysc.count(old_sys)}"
+          sysc = sysc.replace(old_sys, new_sys)
+          with open("kernel/sys.c", "w") as f:
+              f.write(sysc)
+
+          # --- 2b. block/ioprio.c ---
+          with open("block/ioprio.c", "r") as f:
+              iop = f.read()
+          old_iop = "\t\t\tif (!who)\n\t\t\t\tuser = current_user();\n\t\t\telse\n\t\t\t\tuser = find_user(uid);"
+          new_iop = "\t\t\tif (!who)\n\t\t\t\tuser = current_user();\n\t\t\telse {\n\t\t\t\tif (current_uid().val >= 10000 && uid.val >= 10000 && !uid_eq(uid, current_uid()))\n\t\t\t\t\tbreak;\n\t\t\t\tuser = find_user(uid);\n\t\t\t}"
+          assert iop.count(old_iop) == 2, f"block/ioprio.c count={iop.count(old_iop)}"
+          iop = iop.replace(old_iop, new_iop)
+          with open("block/ioprio.c", "w") as f:
+              f.write(iop)
+
+          # --- 3. kernel/kallsyms.c ---
+          with open("kernel/kallsyms.c", "r") as f:
+              ks = f.read()
+          old_ks = "\t/* Some debugging symbols have no name.  Ignore them. */\n\tif (!iter->name[0])\n\t\treturn 0;"
+          new_ks = (
+              "\t/* Some debugging symbols have no name.  Ignore them. */\n"
+              "\tif (!iter->name[0])\n"
+              "\t\treturn 0;\n"
+              "\tif (!strncmp(iter->name, \"ksu_\", 4) || strstr(iter->name, \"_ksu_\") ||\n"
+              "\t    !strncmp(iter->name, \"susfs_\", 6) || strstr(iter->name, \"_susfs_\") ||\n"
+              "\t    !strncmp(iter->name, \"bbg_\", 4) || strstr(iter->name, \"baseband_guard\"))\n"
+              "\t\treturn 0;"
+          )
+          assert ks.count(old_ks) == 1, f"kernel/kallsyms.c count={ks.count(old_ks)}"
+          ks = ks.replace(old_ks, new_ks)
+          with open("kernel/kallsyms.c", "w") as f:
+              f.write(ks)
+          print("[+] All 3 kernel optimization patches applied cleanly.")
+          PYEOF
+
       - name: 🧰 Patch Kernel of Re:Kernel
         uses: ./.github/workflows/patch-rekernel
 
