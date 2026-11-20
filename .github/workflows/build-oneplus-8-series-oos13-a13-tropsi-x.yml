@@ -455,7 +455,49 @@ jobs:
           ks = ks.replace(old_ks, new_ks)
           with open("kernel/kallsyms.c", "w") as f:
               f.write(ks)
-          print("[+] All 3 kernel optimization patches applied cleanly.")
+
+          # --- 4. net/core/rtnetlink.c (Block RTM_GETLINK hardware MAC leak) ---
+          with open("net/core/rtnetlink.c", "r") as f:
+              rtn = f.read()
+          old_rtn = (
+              "\tif (dev->addr_len) {\n"
+              "\t\tif (nla_put(skb, IFLA_ADDRESS, dev->addr_len, dev->dev_addr) ||\n"
+              "\t\t    nla_put(skb, IFLA_BROADCAST, dev->addr_len, dev->broadcast))\n"
+              "\t\t\tgoto nla_put_failure;\n"
+              "\t}"
+          )
+          new_rtn = (
+              "\tif (dev->addr_len) {\n"
+              "\t\tconst void *src_addr = dev->dev_addr;\n"
+              "\t\tunsigned char zero_addr[MAX_ADDR_LEN] = {0};\n"
+              "\t\tif (current_uid().val >= 10000 && !capable(CAP_NET_ADMIN))\n"
+              "\t\t\tsrc_addr = zero_addr;\n"
+              "\t\tif (nla_put(skb, IFLA_ADDRESS, dev->addr_len, src_addr) ||\n"
+              "\t\t    nla_put(skb, IFLA_BROADCAST, dev->addr_len, dev->broadcast))\n"
+              "\t\t\tgoto nla_put_failure;\n"
+              "\t}"
+          )
+          assert rtn.count(old_rtn) == 1, f"net/core/rtnetlink.c count={rtn.count(old_rtn)}"
+          rtn = rtn.replace(old_rtn, new_rtn)
+          with open("net/core/rtnetlink.c", "w") as f:
+              f.write(rtn)
+
+          # --- 5. net/core/neighbour.c (Block RTM_GETNEIGH ARP neighbor leak) ---
+          with open("net/core/neighbour.c", "r") as f:
+              nbr = f.read()
+          old_nbr = "static int neigh_dump_info(struct sk_buff *skb, struct netlink_callback *cb)\n{"
+          new_nbr = (
+              "static int neigh_dump_info(struct sk_buff *skb, struct netlink_callback *cb)\n"
+              "{\n"
+              "\tif (current_uid().val >= 10000 && !capable(CAP_NET_ADMIN))\n"
+              "\t\treturn -EPERM;"
+          )
+          assert nbr.count(old_nbr) == 1, f"net/core/neighbour.c count={nbr.count(old_nbr)}"
+          nbr = nbr.replace(old_nbr, new_nbr)
+          with open("net/core/neighbour.c", "w") as f:
+              f.write(nbr)
+
+          print("[+] All 5 kernel optimization patches (selinux, sys, ioprio, kallsyms, netlink) applied cleanly.")
           PYEOF
 
       - name: 🧰 Patch Kernel of Re:Kernel
