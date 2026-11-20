@@ -391,8 +391,8 @@ jobs:
           # --- 2a. kernel/sys.c ---
           with open("kernel/sys.c", "r") as f:
               sysc = f.read()
-          old_sys = "\t\telse if (!uid_eq(uid, cred->uid)) {\n\t\t\tuser = find_user(uid);"
-          new_sys = "\t\telse if (!uid_eq(uid, cred->uid)) {\n\t\t\tif (cred->uid.val >= 10000 && uid.val >= 10000)\n\t\t\t\tgoto out_unlock;\n\t\t\tuser = find_user(uid);"
+          old_sys = "\t\telse if (!uid_eq(uid, cred->uid)) {"
+          new_sys = "\t\telse if (!uid_eq(uid, cred->uid)) {\n\t\t\tif (cred->uid.val >= 10000 && uid.val >= 10000)\n\t\t\t\tgoto out_unlock;"
           assert sysc.count(old_sys) == 2, f"kernel/sys.c count={sysc.count(old_sys)}"
           sysc = sysc.replace(old_sys, new_sys)
           with open("kernel/sys.c", "w") as f:
@@ -401,10 +401,40 @@ jobs:
           # --- 2b. block/ioprio.c ---
           with open("block/ioprio.c", "r") as f:
               iop = f.read()
-          old_iop = "\t\t\tif (!who)\n\t\t\t\tuser = current_user();\n\t\t\telse\n\t\t\t\tuser = find_user(uid);"
-          new_iop = "\t\t\tif (!who)\n\t\t\t\tuser = current_user();\n\t\t\telse {\n\t\t\t\tif (current_uid().val >= 10000 && uid.val >= 10000 && !uid_eq(uid, current_uid()))\n\t\t\t\t\tbreak;\n\t\t\t\tuser = find_user(uid);\n\t\t\t}"
-          assert iop.count(old_iop) == 2, f"block/ioprio.c count={iop.count(old_iop)}"
-          iop = iop.replace(old_iop, new_iop)
+          old_iop_susfs = (
+              "\t\t\tif (!who)\n"
+              "\t\t\t\tuser = current_user();\n"
+              "\t\t\telse\n"
+              "#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER\n"
+              "\t\t\t{\n"
+              "\t\t\t\tif (current_uid().val >= 10000 && susfs_is_priority_uid_filtered(uid.val))\n"
+              "\t\t\t\t\tbreak;\n"
+              "\t\t\t\tuser = find_user(uid);\n"
+              "\t\t\t}\n"
+              "#else\n"
+              "\t\t\t\tuser = find_user(uid);\n"
+              "#endif // #ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER"
+          )
+          old_iop_plain = "\t\t\tif (!who)\n\t\t\t\tuser = current_user();\n\t\t\telse\n\t\t\t\tuser = find_user(uid);"
+          new_iop = (
+              "\t\t\tif (!who)\n"
+              "\t\t\t\tuser = current_user();\n"
+              "\t\t\telse {\n"
+              "\t\t\t\tif (current_uid().val >= 10000 && uid.val >= 10000 && !uid_eq(uid, current_uid()))\n"
+              "\t\t\t\t\tbreak;\n"
+              "#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER\n"
+              "\t\t\t\tif (current_uid().val >= 10000 && susfs_is_priority_uid_filtered(uid.val))\n"
+              "\t\t\t\t\tbreak;\n"
+              "#endif\n"
+              "\t\t\t\tuser = find_user(uid);\n"
+              "\t\t\t}"
+          )
+          if iop.count(old_iop_susfs) == 2:
+              iop = iop.replace(old_iop_susfs, new_iop)
+          elif iop.count(old_iop_plain) == 2:
+              iop = iop.replace(old_iop_plain, new_iop)
+          else:
+              raise AssertionError(f"block/ioprio.c unexpected format: susfs={iop.count(old_iop_susfs)} plain={iop.count(old_iop_plain)}")
           with open("block/ioprio.c", "w") as f:
               f.write(iop)
 
