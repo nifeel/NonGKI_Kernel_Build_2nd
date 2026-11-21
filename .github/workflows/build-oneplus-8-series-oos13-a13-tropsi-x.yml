@@ -502,7 +502,29 @@ jobs:
           with open("net/core/neighbour.c", "w") as f:
               f.write(nbr)
 
-          print("[+] All 5 kernel optimization patches (selinux, sys, ioprio, kallsyms, netlink) applied cleanly.")
+          # --- 6. drivers/kernelsu/supercall/supercall.c (Block unprivileged KSU_INSTALL_MAGIC2 probe) ---
+          with open("drivers/kernelsu/supercall/supercall.c", "r") as f:
+              sc = f.read()
+          old_sc = (
+              "int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg)\n"
+              "{\n"
+              "    if (magic1 != KSU_INSTALL_MAGIC1)\n"
+              "        return -EINVAL;"
+          )
+          new_sc = (
+              "int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg)\n"
+              "{\n"
+              "    if (magic1 != KSU_INSTALL_MAGIC1)\n"
+              "        return -EINVAL;\n\n"
+              "    if (ksu_get_uid_t(current_uid()) >= 10000 && !allowed_for_su())\n"
+              "        return -EINVAL;"
+          )
+          assert sc.count(old_sc) == 1, f"supercall.c count={sc.count(old_sc)}"
+          sc = sc.replace(old_sc, new_sc)
+          with open("drivers/kernelsu/supercall/supercall.c", "w") as f:
+              f.write(sc)
+
+          print("[+] All 6 kernel optimization patches (selinux, sys, ioprio, kallsyms, netlink, supercall) applied cleanly.")
           PYEOF
 
       - name: 🧰 Patch Kernel of Re:Kernel
