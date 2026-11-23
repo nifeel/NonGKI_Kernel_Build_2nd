@@ -179,133 +179,183 @@ jobs:
           sed -i 's/t->sender_euid = proc->cred->euid;/t->sender_euid = task_euid(proc->tsk);/' drivers/android/binder.c
           grep -q 't->sender_euid = task_euid(proc->tsk);' drivers/android/binder.c
 
-          # 1) Fix selinux_hide timing side-channel (fast-path single-policydb on stack)
+          # 1) Fix selinux_hide timing side-channel (stack buffers + equalize failure latency)
           # 2) Filter cross-app getpriority/setpriority & ioprio_get/ioprio_set in kernel source
           # 3) Hide residual KSU/SuSFS/BBG symbols in /proc/kallsyms
           python3 - << 'PYEOF'
-          # --- 1. drivers/kernelsu/feature/selinux_hide.c ---
-          with open("drivers/kernelsu/feature/selinux_hide.c", "r") as f:
+          import os
+
+          # --- 1. drivers/kernelsu/feature/selinux_hide/selinux_hide_auto.c ---
+          sh_path = "drivers/kernelsu/feature/selinux_hide/selinux_hide_auto.c"
+          if not os.path.exists(sh_path):
+              sh_path = "drivers/kernelsu/feature/selinux_hide.c"
+          with open(sh_path, "r") as f:
               sh = f.read()
 
-          old_s2c_start = "/*\n * Caveat:  Mutates scontext.\n */\nstatic int string_to_context_struct("
-          old_s2c_end = "    *orig_rc_p = orig_rc;\n    return rc;\n}"
-          s1 = sh.index(old_s2c_start)
-          e1 = sh.index(old_s2c_end, s1) + len(old_s2c_end)
+          def replace_once(src, old, new, desc):
+              cnt = src.count(old)
+              assert cnt == 1, f"{sh_path}: {desc} count={cnt}"
+              return src.replace(old, new, 1)
 
-          new_s2c = """/*
-           * Caveat:  Mutates scontext.
-           */
-          static int ksu_string_to_context_one(struct policydb *pol, struct sidtab *sidtabp, char *scontext,
-                                               u32 scontext_len, struct context *ctx, u32 def_sid)
-          {
-              struct role_datum *role;
-              struct type_datum *typdatum;
-              struct user_datum *usrdatum;
-              char *scontextp, *p, oldc;
-              int rc = -EINVAL;
-
-              context_init(ctx);
-              scontextp = scontext;
-
-              /* Extract the user. */
-              p = scontextp;
-              while (*p && *p != ':')
-                  p++;
-              if (*p == 0)
-                  goto out;
-              *p++ = 0;
-
-              usrdatum = symtab_search(&pol->p_users, scontextp);
-              if (!usrdatum)
-                  goto out;
-              ctx->user = usrdatum->value;
-
-              /* Extract role. */
-              scontextp = p;
-              while (*p && *p != ':')
-                  p++;
-              if (*p == 0)
-                  goto out;
-              *p++ = 0;
-
-              role = symtab_search(&pol->p_roles, scontextp);
-              if (!role)
-                  goto out;
-              ctx->role = role->value;
-
-              /* Extract type. */
-              scontextp = p;
-              while (*p && *p != ':')
-                  p++;
-              oldc = *p;
-              *p++ = 0;
-
-              typdatum = symtab_search(&pol->p_types, scontextp);
-              if (!typdatum || typdatum->attribute)
-                  goto out;
-              ctx->type = typdatum->value;
-
-          #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0) || defined(KSU_COMPAT_HAS_STRICTER_MLS_CONTEXT_TO_SID)
-              rc = mls_context_to_sid(pol, oldc, p, ctx, sidtabp, def_sid);
-          #else
-              rc = mls_context_to_sid(pol, oldc, &p, ctx, sidtabp, def_sid);
-              if ((p - scontext) < scontext_len) {
-                  rc = -EINVAL;
-                  goto out;
-              }
-          #endif
-              if (rc)
-                  goto out;
-
-              /* Check the validity of the new context. */
-              rc = -EINVAL;
-              if (policydb_context_isvalid(pol, ctx))
-                  rc = 0;
-          out:
-              if (rc)
-                  context_destroy(ctx);
-              return rc;
-          }""".replace("\n          ", "\n")
-
-          sh = sh[:s1] + new_s2c + sh[e1:]
-
-          old_k2s_start = (
-              "// remove static in susfs\n"
-              "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)\n"
-              "__maybe_static int security_context_to_sid_with_policy("
+          sh = replace_once(
+              sh,
+              "#include <linux/cpu.h>\n",
+              "#include <linux/cpu.h>\n#include <linux/processor.h>\n",
+              "processor.h include",
           )
-          old_k2s_end = "    kfree(scontext3);\n    kfree(scontext2);\n    kfree(str);\n    return rc;\n}"
-          assert sh.count(old_k2s_start) == 1, f"old_k2s_start count={sh.count(old_k2s_start)}"
-          s2 = sh.index(old_k2s_start)
-          e2 = sh.index(old_k2s_end, s2) + len(old_k2s_end)
 
-          new_k2s = """// remove static in susfs
-          #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
-          __maybe_static int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext,
-                                                                 u32 scontext_len, u32 *sid, u32 def_sid, gfp_t gfp_flags,
-                                                                 u32 *orig_sid_p, int *orig_rc_p)
-          #else
-          static int ksu_security_context_to_sid(struct policydb *orig_policydb, struct sidtab *orig_sidtab,
-                                                 struct policydb *policydb, struct sidtab *sidtab, const char *scontext,
-                                                 u32 scontext_len, u32 *sid, u32 def_sid, gfp_t gfp_flags, u32 *orig_sid_p,
-                                                 int *orig_rc_p)
-          #endif
+          sh = replace_once(
+              sh,
+              "static bool ksu_selinux_hide_keep_backup __read_mostly = false;\n",
+              """static bool ksu_selinux_hide_keep_backup __read_mostly = false;
+
+          static inline u64 ksu_read_cntvct(void)
           {
-          #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
-              struct selinux_policy *orig_policy;
-              struct policydb *policydb, *orig_policydb;
-              struct sidtab *sidtab, *orig_sidtab;
+          #ifdef CONFIG_ARM64
+              u64 cval;
+              asm volatile("isb; mrs %0, cntvct_el0" : "=r"(cval) :: "memory");
+              return cval;
+          #else
+              return 0;
           #endif
-              char stack_buf2[128], stack_buf3[128];
-              char *scontext2, *scontext3;
+          }
+
+          static inline void ksu_equalize_invalid_timing(u64 t0, int rc)
+          {
+              if (likely(!rc))
+                  return;
+          #ifdef CONFIG_ARM64
+              while ((s64)(ksu_read_cntvct() - t0) < 48)
+                  cpu_relax();
+          #else
+              (void)t0;
+          #endif
+          }
+          """.replace("\n          ", "\n"),
+              "timing helpers",
+          )
+
+          sh = replace_once(
+              sh,
+              """static ssize_t my_write_context(struct file *file, char *buf, size_t size)
+          {
+              // apply to all app uids
+              if (likely(ksu_get_uid_t(current_uid()) < 10000)) {
+                  return orig_context_write(file, buf, size);
+              }
+              char *canon = NULL;""".replace("\n          ", "\n"),
+              """static ssize_t my_write_context(struct file *file, char *buf, size_t size)
+          {
+              // apply to all app uids
+              if (likely(ksu_get_uid_t(current_uid()) < 10000)) {
+                  return orig_context_write(file, buf, size);
+              }
+              u64 ksu_t0 = ksu_read_cntvct();
+              char *canon = NULL;""".replace("\n          ", "\n"),
+              "my_write_context entry",
+          )
+
+          sh = replace_once(
+              sh,
+              """    memcpy(buf, canon, len);
+              length = len;
+          out:
+              kfree(canon);
+              return length;
+          }""".replace("\n          ", "\n"),
+              """    memcpy(buf, canon, len);
+              length = len;
+          out:
+              kfree(canon);
+              if (length < 0)
+                  ksu_equalize_invalid_timing(ksu_t0, (int)length);
+              return length;
+          }""".replace("\n          ", "\n"),
+              "my_write_context exit",
+          )
+
+          sh = replace_once(
+              sh,
+              """static ssize_t my_write_access(struct file *file, char *buf, size_t size)
+          {
+              // apply to all app uids
+              if (likely(ksu_get_uid_t(current_uid()) < 10000)) {
+                  return orig_access_write(file, buf, size);
+              }
+              char *scon = NULL, *tcon = NULL;""".replace("\n          ", "\n"),
+              """static ssize_t my_write_access(struct file *file, char *buf, size_t size)
+          {
+              // apply to all app uids
+              if (likely(ksu_get_uid_t(current_uid()) < 10000)) {
+                  return orig_access_write(file, buf, size);
+              }
+              u64 ksu_t0 = ksu_read_cntvct();
+              char *scon = NULL, *tcon = NULL;""".replace("\n          ", "\n"),
+              "my_write_access entry",
+          )
+
+          sh = replace_once(
+              sh,
+              """                       avd.auditdeny, avd.seqno, avd.flags);
+          out:
+              kfree(tcon);
+              kfree(scon);
+              return length;
+          }""".replace("\n          ", "\n"),
+              """                       avd.auditdeny, avd.seqno, avd.flags);
+          out:
+              kfree(tcon);
+              kfree(scon);
+              if (length < 0)
+                  ksu_equalize_invalid_timing(ksu_t0, (int)length);
+              return length;
+          }""".replace("\n          ", "\n"),
+              "my_write_access exit",
+          )
+
+          sh = replace_once(
+              sh,
+              "        error = security_context_to_sid_live(value, size, &sid);\n"
+              "        if (error) {\n"
+              "            return error;\n"
+              "        }\n",
+              "        u64 ksu_t0 = ksu_read_cntvct();\n"
+              "        error = security_context_to_sid_live(value, size, &sid);\n"
+              "        if (error) {\n"
+              "            ksu_equalize_invalid_timing(ksu_t0, error);\n"
+              "            return error;\n"
+              "        }\n",
+              "ksu_handle_selinux_setprocattr invalid timing",
+          )
+
+          sh = replace_once(
+              sh,
+              """    char *scontext2;
               struct context context, orig_context;
               int rc = 0, orig_rc = -EINVAL;
               u32 orig_sid;
+              u32 policy_generation;
 
               /* An empty security context is never valid. */
               if (!scontext_len)
                   return -EINVAL;
 
+              /* Copy the string to allow changes and ensure a NUL terminator */
+              scontext2 = kmemdup_nul(scontext, scontext_len, gfp_flags);
+              if (!scontext2)
+                  return -ENOMEM;""".replace("\n          ", "\n"),
+              """    char stack_buf2[128];
+              char *scontext2;
+              struct context context, orig_context;
+              int rc = 0, orig_rc = -EINVAL;
+              u32 orig_sid;
+              u32 policy_generation;
+
+              /* An empty security context is never valid. */
+              if (!scontext_len)
+                  return -EINVAL;
+
+              /* Copy the string to allow changes and ensure a NUL terminator */
               if (scontext_len < sizeof(stack_buf2)) {
                   memcpy(stack_buf2, scontext, scontext_len);
                   stack_buf2[scontext_len] = '\\0';
@@ -314,78 +364,83 @@ jobs:
                   scontext2 = kmemdup_nul(scontext, scontext_len, gfp_flags);
                   if (!scontext2)
                       return -ENOMEM;
-              }
+              }""".replace("\n          ", "\n"),
+              "ksu_security_context_to_sid stack_buf2 alloc",
+          )
 
-              *sid = SECSID_NULL;
-              if (orig_sid_p)
-                  *orig_sid_p = SECSID_NULL;
-
-          #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
-              rcu_read_lock();
-              orig_policy = rcu_dereference(selinux_state.policy);
-              orig_policydb = &orig_policy->policydb;
-              orig_sidtab = orig_policy->sidtab;
-              policydb = &policy->policydb;
-              sidtab = policy->sidtab;
-          #else
-              ksu_lock_sepolicy_legacy();
-          #endif
-              rc = ksu_string_to_context_one(policydb, sidtab, scontext2, scontext_len, &context, def_sid);
-              if (!rc) {
-          #ifdef KSU_COMPAT_HAS_CONTEXT_ADD_HASH
-                  rc = context_add_hash(policydb, &context);
-          #endif
-                  if (!rc)
-                      rc = sidtab_context_to_sid(sidtab, &context, sid);
-                  context_destroy(&context);
-
-                  if (orig_sid_p || orig_rc_p) {
-                      if (scontext_len < sizeof(stack_buf3)) {
-                          memcpy(stack_buf3, scontext, scontext_len);
-                          stack_buf3[scontext_len] = '\\0';
-                          scontext3 = stack_buf3;
-                      } else {
-                          scontext3 = kmemdup_nul(scontext, scontext_len, GFP_ATOMIC);
-                      }
-                      if (!scontext3) {
-                          orig_rc = -ENOMEM;
-                      } else {
-                          orig_rc = ksu_string_to_context_one(orig_policydb, orig_sidtab, scontext3, scontext_len,
-                                                              &orig_context, def_sid);
-                          if (!orig_rc) {
-          #ifdef KSU_COMPAT_HAS_CONTEXT_ADD_HASH
-                              orig_rc = context_add_hash(orig_policydb, &orig_context);
-          #endif
-                              if (!orig_rc) {
-                                  orig_rc = sidtab_context_to_sid(orig_sidtab, &orig_context, &orig_sid);
-                                  if (orig_sid_p)
-                                      *orig_sid_p = orig_sid;
-                              }
-                              context_destroy(&orig_context);
-                          }
-                          if (scontext3 != stack_buf3)
-                              kfree(scontext3);
-                      }
-                  }
-              } else {
-                  (void)orig_policydb;
-                  (void)orig_sidtab;
-              }
-          #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
-              rcu_read_unlock();
-          #else
-              ksu_unlock_sepolicy_legacy();
-          #endif
-              if (orig_rc_p)
+          sh = replace_once(
+              sh,
+              """    if (orig_rc_p)
+                  *orig_rc_p = orig_rc;
+              kfree(scontext2);
+              return rc;
+          }""".replace("\n          ", "\n"),
+              """    if (orig_rc_p)
                   *orig_rc_p = orig_rc;
               if (scontext2 != stack_buf2)
                   kfree(scontext2);
               return rc;
-          }""".replace("\n          ", "\n")
+          }""".replace("\n          ", "\n"),
+              "ksu_security_context_to_sid stack_buf2 free",
+          )
 
-          sh = sh[:s2] + new_k2s + sh[e2:]
-          assert "ksu_string_to_context_one" in sh and "string_to_context_struct" not in sh
-          with open("drivers/kernelsu/feature/selinux_hide.c", "w") as f:
+          sh = replace_once(
+              sh,
+              """    struct context context;
+              char *scontext2;
+              u32 backup_sid, policy_generation;
+              int rc;
+
+              /* An empty security context is never valid. */
+              if (!scontext_len)
+                  return -EINVAL;
+
+              /* Copy the string to allow changes and ensure a NUL terminator */
+              scontext2 = kmemdup_nul(scontext, scontext_len, GFP_KERNEL);
+              if (!scontext2)
+                  return -ENOMEM;""".replace("\n          ", "\n"),
+              """    struct context context;
+              char stack_buf2[128];
+              char *scontext2;
+              u32 backup_sid, policy_generation;
+              int rc;
+
+              /* An empty security context is never valid. */
+              if (!scontext_len)
+                  return -EINVAL;
+
+              /* Copy the string to allow changes and ensure a NUL terminator */
+              if (scontext_len < sizeof(stack_buf2)) {
+                  memcpy(stack_buf2, scontext, scontext_len);
+                  stack_buf2[scontext_len] = '\\0';
+                  scontext2 = stack_buf2;
+              } else {
+                  scontext2 = kmemdup_nul(scontext, scontext_len, GFP_KERNEL);
+                  if (!scontext2)
+                      return -ENOMEM;
+              }""".replace("\n          ", "\n"),
+              "security_context_to_sid_live stack_buf2 alloc",
+          )
+
+          sh = replace_once(
+              sh,
+              """    kfree(scontext2);
+              return rc;
+          }
+
+          /*
+           * Write the security context string representation of""".replace("\n          ", "\n"),
+              """    if (scontext2 != stack_buf2)
+                  kfree(scontext2);
+              return rc;
+          }
+
+          /*
+           * Write the security context string representation of""".replace("\n          ", "\n"),
+              "security_context_to_sid_live stack_buf2 free",
+          )
+
+          with open(sh_path, "w") as f:
               f.write(sh)
 
           # --- 2a. kernel/sys.c ---
