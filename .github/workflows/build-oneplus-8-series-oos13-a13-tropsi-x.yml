@@ -220,16 +220,22 @@ jobs:
           #endif
           }
 
-          static inline void ksu_equalize_invalid_timing(u64 t0, int rc)
+          static inline void ksu_equalize_timing_ticks(u64 t0, int rc, u64 target_ticks)
           {
               if (likely(!rc))
                   return;
           #ifdef CONFIG_ARM64
-              while ((s64)(ksu_read_cntvct() - t0) < 48)
+              while ((s64)(ksu_read_cntvct() - t0) < (s64)target_ticks)
                   cpu_relax();
           #else
               (void)t0;
+              (void)target_ticks;
           #endif
+          }
+
+          static inline void ksu_equalize_invalid_timing(u64 t0, int rc)
+          {
+              ksu_equalize_timing_ticks(t0, rc, 48);
           }
           """.replace("\n          ", "\n"),
               "timing helpers",
@@ -315,17 +321,45 @@ jobs:
 
           sh = replace_once(
               sh,
+              """    error = ksu_avc_has_perm_compat(mysid, mysid, SECCLASS_PROCESS, PROCESS__SETCURRENT, NULL);
+              if (error)
+                  return error;
+
+              /* Obtain a SID for the context, if one was specified. */""".replace("\n          ", "\n"),
+              """    error = ksu_avc_has_perm_compat(mysid, mysid, SECCLASS_PROCESS, PROCESS__SETCURRENT, NULL);
+              if (error)
+                  return error;
+
+              u64 ksu_t0 = ksu_read_cntvct();
+
+              /* Obtain a SID for the context, if one was specified. */""".replace("\n          ", "\n"),
+              "ksu_handle_selinux_setprocattr entry timing",
+          )
+
+          sh = replace_once(
+              sh,
               "        error = security_context_to_sid_live(value, size, &sid);\n"
               "        if (error) {\n"
               "            return error;\n"
               "        }\n",
-              "        u64 ksu_t0 = ksu_read_cntvct();\n"
               "        error = security_context_to_sid_live(value, size, &sid);\n"
               "        if (error) {\n"
-              "            ksu_equalize_invalid_timing(ksu_t0, error);\n"
+              "            ksu_equalize_timing_ticks(ksu_t0, error, 64);\n"
               "            return error;\n"
               "        }\n",
               "ksu_handle_selinux_setprocattr invalid timing",
+          )
+
+          sh = replace_once(
+              sh,
+              """abort_change:
+              abort_creds(new);
+              return error;""".replace("\n          ", "\n"),
+              """abort_change:
+              abort_creds(new);
+              ksu_equalize_timing_ticks(ksu_t0, error, 64);
+              return error;""".replace("\n          ", "\n"),
+              "ksu_handle_selinux_setprocattr abort timing",
           )
 
           sh = replace_once(
